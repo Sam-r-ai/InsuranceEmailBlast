@@ -45,7 +45,7 @@ def get_leads_from_sheets():
     leads = []
     for row in rows:
         if len(row) >= 4:
-            name = row[0]
+            name = row[0].strip().capitalize()
             email = row[3]
             leads.append((name, email))
     return leads
@@ -62,12 +62,25 @@ def send_email(service, to_name, to_email):
     subject = "Your Life Insurance Program Eligibility – Urgent"
     body = f"""Hi {to_name},
 
-You may still be eligible for the new California Life Insurance Programs, with benefits like permanent coverage and access to funds while living.
+I hope this reaches you in time — I was just reviewing my file list, and your name popped up as someone who may still be eligible for the new California Life Insurance Programs with added living benefits.
 
-Want to see how this compares to what you have? Just reply to this email or call/text me directly.
+These programs were created to help families like yours lock in permanent coverage that never expires and access your money early in case of a critical illness — something most older policies don’t cover.
 
-Talk soon,  
-{AGENT_NAME}  
+If you already have coverage, great — but most of the families I speak to are shocked to find out:
+
+Their policies expire or increase in price as they age
+
+They can’t access any of the money if something happens while they’re still alive
+
+They’re paying more than they should without realizing it
+
+If you want to see how these new options compare to what you currently have (or what you could qualify for), I can send you a personalized breakdown. Just reply to this email or call/text me directly.
+
+🕒 Time-sensitive: I only have access to your file for a short period before it gets closed out.
+
+Talk soon,
+{AGENT_NAME}
+Licensed Broker - Family First Life  
 CA License: {AGENT_LICENSE}  
 📞 {WORK_PHONE}  
 📧 {WORK_EMAIL}
