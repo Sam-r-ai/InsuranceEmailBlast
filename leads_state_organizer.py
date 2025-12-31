@@ -14,12 +14,12 @@ SERVICE_ACCOUNT_FILE = "sheet_service_account.json"
 SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 # 👇 CHANGE THIS AND PRESS ▶ RUN
-TARGET_SHEET_NAME = "NEW TTC"
+TARGET_SHEET_NAME = "Combined TTC 12/30"
 TARGET_RANGE = "A1:ZZ"
 
 # State header aliases (add more if needed)
 STATE_ALIASES = [
-    "state", "st", "province", "region"
+    "state"
 ]
 
 # ----------------------------

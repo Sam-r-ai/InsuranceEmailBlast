@@ -60,7 +60,7 @@ SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 SERVICE_ACCOUNT_FILE = "sheet_service_account.json"
 
 # ✅ Edit these and press ▶ in VS Code
-TARGET_SHEET_NAME = "testsheet"
+TARGET_SHEET_NAME = "email_blast"
 TARGET_RANGE = "A1:ZZ"
 
 # ✅ Header aliases (added "number" under phone)
