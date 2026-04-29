@@ -15,7 +15,8 @@ from googleapiclient.discovery import build
 from google.auth.exceptions import RefreshError
 
 count = 0
-BUSINESS_CARD_PATH = r"images\\JC_BusinessCard.png"
+BUSINESS_CARD_PATH = r"images\Justin_Cheung.png"
+CARRIERS_CARD_PATH = r"images\Carriers.png"
 
 # --- Load environment variables ---
 load_dotenv()
@@ -60,7 +61,7 @@ SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 SERVICE_ACCOUNT_FILE = "sheet_service_account.json"
 
 # ✅ Edit these and press ▶ in VS Code
-TARGET_SHEET_NAME = "email_blast"
+TARGET_SHEET_NAME = "Bad_Numbers_Email"
 TARGET_RANGE = "A1:ZZ"
 
 # ✅ Header aliases (added "number" under phone)
@@ -199,9 +200,8 @@ def format_phone_us(digits: str) -> str:
         return digits  # fallback: return as-is
     return f"({digits[0:3]}) {digits[3:6]}-{digits[6:10]}"
 
-
 # --- Gmail Functions ---
-def create_message(to, subject, body_html, image_path=None):
+def create_message(to, subject, body_html, cards_dict=None):
     message = MIMEMultipart("related")
     message["to"] = to
     message["subject"] = subject
@@ -211,71 +211,63 @@ def create_message(to, subject, body_html, image_path=None):
 
     alternative.attach(MIMEText(body_html, "html", "utf-8"))
 
-    # Attach image inline (CID)
-    if image_path:
-        if not os.path.exists(image_path):
-            raise FileNotFoundError(f"Business card image not found: {image_path}")
-
-        with open(image_path, "rb") as f:
-            img = MIMEImage(f.read())
-            img.add_header("Content-ID", "<businesscard>")
-            img.add_header("Content-Disposition", "inline", filename=os.path.basename(image_path))
-            message.attach(img)
+    # Attach images inline (CIDs)
+    if cards_dict:
+        for cid, path in cards_dict.items():
+            if not os.path.exists(path):
+                print(f"Warning: Image not found: {path}")
+                continue
+            with open(path, "rb") as f:
+                img = MIMEImage(f.read())
+                img.add_header("Content-ID", f"<{cid}>")
+                img.add_header("Content-Disposition", "inline", filename=os.path.basename(path))
+                message.attach(img)
 
     raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
     return {"raw": raw}
 
-
-
 def send_email(gmail_service, to_name, to_email, to_phone):
-    subject = "Something I noticed in your file..."
+    subject = "Updated Life Insurance Rates"
 
     body_html = f"""
-    <html>
-      <body style="font-family: Arial, Helvetica, sans-serif; font-size: 14px; color: #000; line-height: 1.6;">
-        <p>Hi {to_name},</p>
+<html>
+  <body style="font-family: Arial, Helvetica, sans-serif; font-size: 14px; color: #000; line-height: 1.6;">
+    <p>Hi {to_name},</p>
 
-        <p>
-          I was reviewing some older records today and noticed your file was left
-          <strong>open</strong>.
-        </p>
+    <p>
+      My name is <strong>Justin Cheung</strong> with <strong>Family First Life</strong>. 
+      I am a life insurance broker working with the top rated carriers across the United States.
+    </p>
 
-        <p>
-          In the time since we last spoke, the "safety net" most families rely on has become…
-          <strong>different</strong>. You’ve likely felt the shift—the way certain protections
-          aren’t as firm as they used to be. There is a specific
-          <strong>blind spot</strong> in many older plans that often goes unnoticed until the
-          moment it's actually needed.
-        </p>
+    <p>
+      I'm reaching out because a while ago you had inquired through our online portal 
+      looking into your coverage options. Whether you are a young family looking for 
+      <strong>income replacement</strong> securing your family's future, or a senior 
+      living on fixed income needing <strong>affordable final expense coverage</strong> 
+      to remove financial burden from the family, I am here to find the perfect solution.
+    </p>
 
-        <p>
-          I’m not sure if your situation has evolved, but leaving that gap
-          <strong>unattended</strong> is a risk that weighs more heavily now than it did a year ago.
-        </p>
+    <p>
+      I am open to meeting you. Reply to me a good time to meetand I will see if I can fit you in.
+    </p>
 
-        <p>
-          I’ve closed this gap for several others recently. It’s a quiet fix, but the
-          <strong>relief</strong> it brings is immediate.
-        </p>
+    <p>
+      You may also book an appointment directly on my calendar here:<br>
+      <a href="https://calendly.com/justingimho/life-insurance-consulting" style="color: #0066cc;">
+        https://calendly.com/justingimho/life-insurance-consulting
+      </a>
+    </p>
 
-        <p>
-          Are you still at {to_phone}, or should we exchange a few notes here?
-        </p>
-
-        <p>
-          Best,<br><br>
-          {AGENT_NAME}<br>
+    <p>Sincerely,</p>
+          <strong>{AGENT_NAME}</strong><br>
           Life Insurance &amp; Annuities Broker<br>
           CA License: {AGENT_LICENSE}<br>
           📞 {WORK_PHONE}<br>
           📧 {WORK_EMAIL}<br>
-          Book an appointment on my calendar:
-          <a href="https://calendly.com/justingimho/life-insurance-consulting">https://calendly.com/justingimho/life-insurance-consulting</a>
-        </p>
+        
         <p style="margin-top:20px;">
-        <img src="cid:businesscard"
-        alt="Business Card"
-        style="max-width:420px;width:100%;border-radius:6px;">
+            <img src="cid:businesscard" alt="Business Card" style="max-width:420px;width:100%;border-radius:6px;display:block;margin-bottom:10px;">
+            <img src="cid:carrierscard" alt="Carriers" style="max-width:420px;width:100%;border-radius:6px;display:block;">
         </p>
 
         <hr style="border:none;border-top:1px solid #ddd;margin:20px 0;">
@@ -288,7 +280,13 @@ def send_email(gmail_service, to_name, to_email, to_phone):
     </html>
     """
 
-    msg = create_message(to_email, subject, body_html, image_path=BUSINESS_CARD_PATH)
+    # Mapping CIDs to file paths
+    cards = {
+        "businesscard": BUSINESS_CARD_PATH,
+        "carrierscard": CARRIERS_CARD_PATH
+    }
+
+    msg = create_message(to_email, subject, body_html, cards_dict=cards)
     gmail_service.users().messages().send(userId="me", body=msg).execute()
 
 # --- Run Program ---
@@ -376,5 +374,8 @@ if __name__ == "__main__":
         print(f"✅ Sent email #{count} to {name_for_greeting} at {email} | phone={to_phone} | email_sent={ts}")
         time.sleep(2)
 
-        if count == 50:
-            quit("Reached 50 emails sent. Stopping to avoid rate limits.")
+#          Book an appointment on my calendar:
+#          <a href="https://calendly.com/justingimho/life-insurance-consulting">https://calendly.com/justingimho/life-insurance-consulting</a>
+#        </p>
+        if count == 75:
+            quit("Reached 75 emails sent. Stopping to avoid rate limits.")
