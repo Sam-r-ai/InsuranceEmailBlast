@@ -4,3 +4,4 @@ __pycache__/
 token.json
 sheet_service_account.json
 images
+token_cleanup.json
