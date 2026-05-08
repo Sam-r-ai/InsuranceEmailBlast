@@ -227,7 +227,7 @@ def create_message(to, subject, body_html, cards_dict=None):
     return {"raw": raw}
 
 def send_email(gmail_service, to_name, to_email, to_phone):
-    subject = "Updated Life Insurance Rates"
+    subject = f"{to_name}, Life Insurance Inquiry"
 
     body_html = f"""
 <html>
@@ -377,5 +377,5 @@ if __name__ == "__main__":
 #          Book an appointment on my calendar:
 #          <a href="https://calendly.com/justingimho/life-insurance-consulting">https://calendly.com/justingimho/life-insurance-consulting</a>
 #        </p>
-        if count == 75:
+        if count == 25:
             quit("Reached 75 emails sent. Stopping to avoid rate limits.")
