@@ -12,7 +12,7 @@ from google.oauth2 import service_account
 # --- Configuration ---
 load_dotenv()
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-TARGET_SHEET_NAME = "Invalid_Emails" # Change this to the exact name of your tab
+TARGET_SHEET_NAME = "Invalid_Email" # Change this to the exact name of your tab
 
 # --- Scopes ---
 GMAIL_SCOPES = ['https://mail.google.com/']
