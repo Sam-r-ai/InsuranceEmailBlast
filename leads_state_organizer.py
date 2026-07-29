@@ -1,128 +1,65 @@
-import os
-import re
-from dotenv import load_dotenv
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
+# leads_state_organizer.py
+# Sorts one tab alphabetically by its State column, in place.
+#
+# Uses a single sortRange batchUpdate request — atomic on Google's side, so
+# a crash or network error can no longer leave the tab cleared, and cell
+# formatting/formulas survive (the old version rewrote the whole tab as raw
+# text). Blank states end up at the bottom.
 
-# ----------------------------
-# Config
-# ----------------------------
-load_dotenv()
-
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "")
-SERVICE_ACCOUNT_FILE = "sheet_service_account.json"
-SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+from common import (
+    build_header_map, get_sheet_id, get_values, sheets_service, with_backoff,
+    SPREADSHEET_ID,
+)
 
 # 👇 CHANGE THIS AND PRESS ▶ RUN
 TARGET_SHEET_NAME = "Combined TTC 12/30"
-TARGET_RANGE = "A1:ZZ"
 
-# State header aliases (add more if needed)
-STATE_ALIASES = [
-    "state"
-]
 
-# ----------------------------
-# Sheets API
-# ----------------------------
-def sheets_service():
-    creds = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE, scopes=SHEETS_SCOPES
-    )
-    return build("sheets", "v4", credentials=creds)
-
-def get_values(svc, sheet_name, a1_range):
-    rng = f"'{sheet_name}'!{a1_range}"
-    resp = svc.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=rng
-    ).execute()
-    return resp.get("values", [])
-
-def clear_range(svc, sheet_name, a1_range):
-    rng = f"'{sheet_name}'!{a1_range}"
-    svc.spreadsheets().values().clear(
-        spreadsheetId=SPREADSHEET_ID,
-        range=rng,
-        body={}
-    ).execute()
-
-def update_values(svc, sheet_name, start_cell, values):
-    rng = f"'{sheet_name}'!{start_cell}"
-    svc.spreadsheets().values().update(
-        spreadsheetId=SPREADSHEET_ID,
-        range=rng,
-        valueInputOption="RAW",
-        body={"values": values}
-    ).execute()
-
-# ----------------------------
-# Helpers
-# ----------------------------
-def normalize_header(h):
-    h = (h or "").strip().lower()
-    h = re.sub(r"[\s\-_]+", " ", h)
-    h = re.sub(r"[^a-z ]+", "", h)
-    return h
-
-def find_state_column(header_row):
-    headers = [normalize_header(h) for h in header_row]
-    for i, h in enumerate(headers):
-        if h in STATE_ALIASES:
-            return i
-        for alias in STATE_ALIASES:
-            if alias in h:
-                return i
-    return None
-
-def get_cell(row, idx):
-    return row[idx] if idx is not None and idx < len(row) else ""
-
-# ----------------------------
-# Core logic
-# ----------------------------
 def sort_sheet_by_state():
-    if not SPREADSHEET_ID:
-        raise RuntimeError("Missing SPREADSHEET_ID in .env")
-
     svc = sheets_service()
-    rows = get_values(svc, TARGET_SHEET_NAME, TARGET_RANGE)
 
+    rows = get_values(svc, TARGET_SHEET_NAME, "A1:ZZ")
     if not rows or len(rows) < 2:
         print("Nothing to sort.")
         return
 
     header = rows[0]
-    data_rows = rows[1:]
-
-    state_col = find_state_column(header)
-
+    header_map = build_header_map(header)
+    state_col = header_map.get("state")
     if state_col is None:
-        raise RuntimeError(
+        raise SystemExit(
             f"❌ Could not find a State column.\n"
-            f"Header row was: {header}\n"
-            f"Accepted names: {STATE_ALIASES}"
+            f"Header row was: {header}"
         )
 
-    # Sort rows by state (case-insensitive, blanks last)
-    def sort_key(row):
-        val = str(get_cell(row, state_col)).strip().upper()
-        return (val == "", val)
+    sheet_id = get_sheet_id(svc, TARGET_SHEET_NAME)
+    if sheet_id is None:
+        raise SystemExit(f"❌ Tab not found: {TARGET_SHEET_NAME}")
 
-    sorted_rows = sorted(data_rows, key=sort_key)
-
-    # Rewrite sheet
-    clear_range(svc, TARGET_SHEET_NAME, "A1:ZZ")
-    update_values(svc, TARGET_SHEET_NAME, "A1", [header])
-    update_values(svc, TARGET_SHEET_NAME, "A2", sorted_rows)
+    request = {
+        "sortRange": {
+            "range": {
+                "sheetId": sheet_id,
+                "startRowIndex": 1,  # keep the header in place
+                "startColumnIndex": 0,
+            },
+            "sortSpecs": [
+                {"dimensionIndex": state_col, "sortOrder": "ASCENDING"}
+            ],
+        }
+    }
+    with_backoff(
+        lambda: svc.spreadsheets().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID, body={"requests": [request]}
+        ).execute(),
+        what=f"sort {TARGET_SHEET_NAME}",
+    )
 
     print(
         f"✅ Sheet '{TARGET_SHEET_NAME}' sorted alphabetically by STATE "
         f"(column {state_col + 1})."
     )
 
-# ----------------------------
-# Run
-# ----------------------------
+
 if __name__ == "__main__":
     sort_sheet_by_state()

@@ -1,22 +1,22 @@
 # sheets_scrubber.py
-# Scrub leads OUT of non-client tabs by matching phone numbers found in "clients" tabs.
+# Removes existing clients from lead tabs so they never get cold outreach.
 #
-# ✅ You hardcode:
-#   - SOURCE_OF_TRUTH_SHEETS: sheets whose phone numbers should be protected (never remove from these)
-#   - IGNORE_SHEETS: sheets to skip entirely (including MASTER, logs, etc.)
+#   1) Collects phone numbers AND emails from SOURCE_OF_TRUTH_SHEETS
+#   2) Iterates every other tab (except ignored + source + bookkeeping tabs)
+#   3) Deletes any row whose phone or email matches a protected contact
+#   4) Prints exactly who got removed, per tab
 #
-# ✅ What it does:
-#   1) Collects all phone numbers from SOURCE_OF_TRUTH_SHEETS
-#   2) Iterates every other sheet in the spreadsheet (except ignored + source sheets)
-#   3) Removes any row whose phone matches a protected phone
-#   4) Prints exactly who got removed (name + phone), per sheet
-#   5) Writes the cleaned sheet back (header preserved)
+# Rows are deleted with a single atomic batchUpdate per tab (bottom-up),
+# instead of the old clear-the-tab-then-rewrite approach that could wipe a
+# whole tab if the run died mid-way. Formatting and formulas survive.
 
-import os
-import re
-from dotenv import load_dotenv
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+from common import (
+    BOOKKEEPING_TABS, build_header_map, delete_rows, format_phone_us,
+    get_cell, get_values, list_sheet_titles, normalize_email, normalize_phone,
+    sheets_service,
+)
 
 # =========================
 # ✅ EDIT THESE SETTINGS
@@ -27,232 +27,138 @@ SOURCE_OF_TRUTH_SHEETS = [
 ]
 
 IGNORE_SHEETS = [
-    "MASTER",
     "Archive",
     "Do Not Touch",
 ]
-
-RANGE_READ = "A1:ZZ"   # big enough for all columns
 # =========================
 
-load_dotenv()
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "")
-SERVICE_ACCOUNT_FILE = "sheet_service_account.json"
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]  # write
 
-PHONE_HEADER_ALIASES = [
-    "phone", "phone number", "number", "mobile", "cell", "cell phone",
-    "telephone", "tel", "contact number", "contact"
-]
-
-NAME_HEADER_ALIASES = {
-    "first_name": ["first", "first name", "firstname", "fname", "given name"],
-    "last_name": ["last", "last name", "lastname", "lname", "surname", "family name"],
-}
-
-def sheets_service():
-    creds = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE, scopes=SCOPES
-    )
-    return build("sheets", "v4", credentials=creds)
-
-def list_sheet_titles(svc):
-    meta = svc.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
-    return [s["properties"]["title"] for s in meta.get("sheets", [])]
-
-def get_values(svc, sheet_name, a1_range=RANGE_READ):
-    rng = f"'{sheet_name}'!{a1_range}"
-    resp = svc.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID, range=rng
-    ).execute()
-    return resp.get("values", [])
-
-def clear_values(svc, sheet_name, a1_range=RANGE_READ):
-    rng = f"'{sheet_name}'!{a1_range}"
-    svc.spreadsheets().values().clear(
-        spreadsheetId=SPREADSHEET_ID, range=rng, body={}
-    ).execute()
-
-def update_values(svc, sheet_name, start_cell, values):
-    rng = f"'{sheet_name}'!{start_cell}"
-    svc.spreadsheets().values().update(
-        spreadsheetId=SPREADSHEET_ID,
-        range=rng,
-        valueInputOption="RAW",
-        body={"values": values}
-    ).execute()
-
-def normalize_header(h: str) -> str:
-    h = (h or "").strip().lower()
-    h = re.sub(r"[\s\-_]+", " ", h)
-    h = re.sub(r"[^a-z0-9 ]+", "", h)
-    return h
-
-def normalize_phone(x: str) -> str:
-    if not x:
-        return ""
-    digits = re.sub(r"\D", "", str(x))
-    if len(digits) == 11 and digits.startswith("1"):
-        digits = digits[1:]
-    return digits if len(digits) == 10 else ""
-
-def format_phone_us(digits: str) -> str:
-    if not digits:
-        return ""
-    digits = re.sub(r"\D", "", digits)
-    if len(digits) != 10:
-        return digits
-    return f"({digits[0:3]}) {digits[3:6]}-{digits[6:10]}"
-
-def find_phone_col(header_row):
-    headers = [normalize_header(h) for h in header_row]
-    aliases = [normalize_header(a) for a in PHONE_HEADER_ALIASES]
-
-    # exact match
-    for i, h in enumerate(headers):
-        if h in aliases:
-            return i
-
-    # phrase/word match (safe)
-    for i, h in enumerate(headers):
-        words = set(h.split())
-        for a in aliases:
-            if " " in a and a in h:
-                return i
-            if " " not in a and a in words:
-                return i
-
-    return None
-
-def find_name_cols(header_row):
-    headers = [normalize_header(h) for h in header_row]
-    first_aliases = set(normalize_header(a) for a in NAME_HEADER_ALIASES["first_name"])
-    last_aliases  = set(normalize_header(a) for a in NAME_HEADER_ALIASES["last_name"])
-
-    first_idx = None
-    last_idx = None
-
-    for i, h in enumerate(headers):
-        if h in first_aliases and first_idx is None:
-            first_idx = i
-        if h in last_aliases and last_idx is None:
-            last_idx = i
-
-    return first_idx, last_idx
-
-def get_cell(row, idx):
-    return row[idx] if idx is not None and idx < len(row) else ""
-
-def collect_protected_phones(svc):
-    protected = set()
-
+def collect_protected_contacts(svc):
+    phones, emails = set(), set()
     for sheet in SOURCE_OF_TRUTH_SHEETS:
         rows = get_values(svc, sheet)
         if not rows or len(rows) < 2:
             print(f"⚠️ Source sheet '{sheet}' empty or missing rows. Skipping.")
             continue
 
-        header = rows[0]
-        phone_col = find_phone_col(header)
-        if phone_col is None:
-            print(f"⚠️ Source sheet '{sheet}' has no phone column. Skipping.")
+        header_map = build_header_map(rows[0])
+        phone_col = header_map.get("phone")
+        email_col = header_map.get("email")
+        if phone_col is None and email_col is None:
+            print(f"⚠️ Source sheet '{sheet}' has no phone or email column. Skipping.")
             continue
 
-        added = 0
+        added_p = added_e = 0
+        bad_phones = []
         for r in rows[1:]:
-            p = normalize_phone(get_cell(r, phone_col))
+            raw_phone = get_cell(r, phone_col)
+            p = normalize_phone(raw_phone, keep_original=False)
             if p:
-                protected.add(p)
-                added += 1
+                phones.add(p)
+                added_p += 1
+            elif str(raw_phone).strip():
+                bad_phones.append(str(raw_phone).strip())
+            e = normalize_email(get_cell(r, email_col))
+            if e:
+                emails.add(e)
+                added_e += 1
 
-        print(f"✅ Collected {added} phone numbers from '{sheet}'")
+        print(f"✅ Collected {added_p} phone(s), {added_e} email(s) from '{sheet}'")
+        if bad_phones:
+            # These clients can't be matched by phone — surface them so the
+            # sheet can be fixed rather than silently leaving them unprotected.
+            print(f"   ⚠️ {len(bad_phones)} phone value(s) in '{sheet}' didn't "
+                  f"normalize to 10 digits and give NO protection: "
+                  f"{', '.join(bad_phones[:10])}"
+                  + (" ..." if len(bad_phones) > 10 else ""))
 
-    return protected
+    return phones, emails
 
-def scrub_sheet(svc, sheet_name, protected_phones):
+
+def scrub_sheet(svc, sheet_name, protected_phones, protected_emails):
     rows = get_values(svc, sheet_name)
     if not rows or len(rows) < 2:
         return 0, 0, []
 
-    header = rows[0]
-    data = rows[1:]
+    header_map = build_header_map(rows[0])
+    phone_col = header_map.get("phone")
+    email_col = header_map.get("email")
+    if phone_col is None and email_col is None:
+        print(f"↪ Skipping '{sheet_name}' (no phone or email column found).")
+        return 0, len(rows) - 1, []
 
-    phone_col = find_phone_col(header)
-    if phone_col is None:
-        print(f"↪ Skipping '{sheet_name}' (no phone column found).")
-        return 0, len(data), []
+    first_idx = header_map.get("first_name")
+    last_idx = header_map.get("last_name")
 
-    first_idx, last_idx = find_name_cols(header)
-
-    kept_rows = []
+    rows_to_delete = []
     removed_people = []
 
-    for r in data:
-        p = normalize_phone(get_cell(r, phone_col))
+    for row_number, r in enumerate(rows[1:], start=2):
+        p = normalize_phone(get_cell(r, phone_col), keep_original=False)
+        e = normalize_email(get_cell(r, email_col))
 
-        if p and p in protected_phones:
-            first = str(get_cell(r, first_idx)).strip() if first_idx is not None else ""
-            last  = str(get_cell(r, last_idx)).strip() if last_idx is not None else ""
-            name = f"{first} {last}".strip() or "(no name)"
-            removed_people.append((name, format_phone_us(p)))
+        matched = (p and p in protected_phones) or (e and e in protected_emails)
+        if not matched:
             continue
 
-        kept_rows.append(r)
+        first = str(get_cell(r, first_idx)).strip() if first_idx is not None else ""
+        last = str(get_cell(r, last_idx)).strip() if last_idx is not None else ""
+        name = f"{first} {last}".strip() or "(no name)"
+        removed_people.append((name, format_phone_us(p) or e))
+        rows_to_delete.append(row_number)
 
-    removed = len(removed_people)
+    if rows_to_delete:
+        delete_rows(svc, sheet_name, rows_to_delete)
 
-    if removed > 0:
-        clear_values(svc, sheet_name)
-        update_values(svc, sheet_name, "A1", [header])
-        if kept_rows:
-            update_values(svc, sheet_name, "A2", kept_rows)
+    kept = (len(rows) - 1) - len(rows_to_delete)
+    return len(rows_to_delete), kept, removed_people
 
-    return removed, len(kept_rows), removed_people
 
 def main():
-    if not SPREADSHEET_ID:
-        raise RuntimeError("Missing SPREADSHEET_ID in .env")
-
     svc = sheets_service()
 
-    # normalize sets for comparisons
     source_lower = {s.strip().lower() for s in SOURCE_OF_TRUTH_SHEETS}
     ignore_lower = {s.strip().lower() for s in IGNORE_SHEETS}
+    ignore_lower |= {s.strip().lower() for s in BOOKKEEPING_TABS}
 
     print("🔎 Building protected list from source sheets...")
-    protected = collect_protected_phones(svc)
-    print(f"\n✅ Total protected phones: {len(protected)}\n")
+    protected_phones, protected_emails = collect_protected_contacts(svc)
+    print(f"\n✅ Protected: {len(protected_phones)} phone(s), "
+          f"{len(protected_emails)} email(s)\n")
 
-    if not protected:
-        print("No protected phones found. Nothing to scrub.")
+    if not protected_phones and not protected_emails:
+        print("No protected contacts found. Nothing to scrub.")
         return
 
-    all_sheets = list_sheet_titles(svc)
-
     removed_total = 0
-    for sh in all_sheets:
+    for sh in list_sheet_titles(svc):
         sh_lower = sh.strip().lower()
-
         if sh_lower in source_lower:
             print(f"🔒 Not touching source sheet '{sh}'")
             continue
-
         if sh_lower in ignore_lower:
             print(f"⏭️ Ignoring '{sh}'")
             continue
 
-        removed, kept, removed_people = scrub_sheet(svc, sh, protected)
-        removed_total += removed
+        try:
+            removed, kept, removed_people = scrub_sheet(
+                svc, sh, protected_phones, protected_emails
+            )
+        except HttpError as e:
+            print(f"❌ Failed on '{sh}' ({e}); continuing with the next tab.")
+            continue
 
+        removed_total += removed
         if removed > 0:
             print(f"🧹 Scrubbed '{sh}':")
-            for name, phone_fmt in removed_people:
-                print(f"   ❌ {name} | {phone_fmt}")
+            for name, contact in removed_people:
+                print(f"   ❌ {name} | {contact}")
             print(f"   → removed {removed}, kept {kept}")
         else:
             print(f"✅ No matches in '{sh}' (kept {kept})")
 
     print(f"\n✅ Done. Total removed across sheets: {removed_total}")
+
 
 if __name__ == "__main__":
     main()

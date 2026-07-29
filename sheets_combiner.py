@@ -1,15 +1,20 @@
 # sheets_combiner.py
-# Combines specific tabs from ONE Google Spreadsheet into a single "MASTER" tab.
+# Combines specific tabs from ONE Google Spreadsheet into a single output tab.
 # - You hardcode which tabs to combine + output column order at the top
-# - Each source tab must have a header row (row 1)
-# - Missing columns in a source tab are ignored (left blank in output)
-# - Extra columns in a source tab are ignored unless you include them in OUTPUT_HEADERS
+# - Source columns are located by header ALIASES (so "Phone", "Cell" and
+#   "number" all map to the number column), not by exact name only
+# - Duplicate leads (same email or phone appearing in multiple tabs) are
+#   written once
+# - email_sent history already on the output tab is carried forward, so
+#   re-running the combiner can never cause already-emailed leads to be
+#   blasted again
+# - If every source tab is empty the run aborts WITHOUT touching the output
 
-import os
-import re
-from dotenv import load_dotenv
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
+from common import (
+    ALIASES, build_header_map, ensure_tab, get_cell, get_values,
+    normalize_email, normalize_header, normalize_phone, overwrite_tab,
+    sheets_service,
+)
 
 # =========================
 # ✅ EDIT THESE SETTINGS
@@ -22,7 +27,8 @@ SOURCE_SHEETS = [
 
 OUTPUT_SHEET_NAME = "Combined TTC 12/30"
 
-# ✅ Output column order (edit this anytime)
+# ✅ Output column order (edit this anytime). email_sent is always kept as
+# the last column so blast history survives a re-combine.
 OUTPUT_HEADERS = [
     "first_name",
     "last_name",
@@ -33,109 +39,121 @@ OUTPUT_HEADERS = [
     "state",
     "hobby",
     "coverage",
-    "fe"
+    "fe",
+    "email_sent",
 ]
 # =========================
 
-load_dotenv()
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "")
-SERVICE_ACCOUNT_FILE = "sheet_service_account.json"
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]  # write
+# Map each output header to a canonical ALIASES field so source columns can
+# be found under any recognizable name.
+OUTPUT_FIELD_FOR_HEADER = {
+    "first_name": "first_name",
+    "last_name": "last_name",
+    "number": "phone",
+    "email": "email",
+    "state": "state",
+    "email_sent": "email_sent",
+}
 
-def sheets_service():
-    creds = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE, scopes=SCOPES
-    )
-    return build("sheets", "v4", credentials=creds)
 
-def norm_header(h: str) -> str:
-    h = (h or "").strip().lower()
-    h = re.sub(r"[\s\-_]+", "_", h)           # spaces/dashes -> _
-    h = re.sub(r"[^a-z0-9_]+", "", h)         # remove weird chars
-    return h
+def dedupe_key(email, phone):
+    if email:
+        return f"e:{email}"
+    if phone:
+        return f"p:{phone}"
+    return None
 
-def read_sheet_values(svc, sheet_name: str, a1_range="A1:ZZ"):
-    rng = f"'{sheet_name}'!{a1_range}"
-    resp = svc.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=rng
-    ).execute()
-    return resp.get("values", [])
 
-def clear_sheet(svc, sheet_name: str):
-    svc.spreadsheets().values().clear(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"'{sheet_name}'!A1:ZZ",
-        body={}
-    ).execute()
+def load_existing_sent_map(svc, tab_title):
+    """email/phone -> email_sent value from the CURRENT output tab."""
+    sent_map = {}
+    rows = get_values(svc, tab_title)
+    if not rows or len(rows) < 2:
+        return sent_map
+    hmap = build_header_map(rows[0])
+    email_idx, phone_idx, sent_idx = hmap.get("email"), hmap.get("phone"), hmap.get("email_sent")
+    if sent_idx is None:
+        return sent_map
+    for r in rows[1:]:
+        sent_val = str(get_cell(r, sent_idx)).strip()
+        if not sent_val:
+            continue
+        e = normalize_email(get_cell(r, email_idx))
+        p = normalize_phone(get_cell(r, phone_idx), keep_original=False)
+        key = dedupe_key(e, p)
+        if key:
+            sent_map[key] = sent_val
+    return sent_map
 
-def write_values(svc, sheet_name: str, start_cell: str, values):
-    svc.spreadsheets().values().update(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"'{sheet_name}'!{start_cell}",
-        valueInputOption="RAW",
-        body={"values": values}
-    ).execute()
-
-def get_tab_names(svc):
-    meta = svc.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
-    return [s["properties"]["title"] for s in meta.get("sheets", [])]
-
-def ensure_output_tab_exists(svc, tab_name: str):
-    tabs = get_tab_names(svc)
-    if tab_name in tabs:
-        return
-    svc.spreadsheets().batchUpdate(
-        spreadsheetId=SPREADSHEET_ID,
-        body={"requests": [{"addSheet": {"properties": {"title": tab_name}}}]}
-    ).execute()
-
-def build_header_index_map(header_row):
-    """
-    Returns: {normalized_header: index}
-    """
-    return {norm_header(h): i for i, h in enumerate(header_row)}
-
-def get_cell(row, idx):
-    return row[idx] if idx is not None and idx < len(row) else ""
 
 def combine():
-    if not SPREADSHEET_ID:
-        raise RuntimeError("Missing SPREADSHEET_ID in .env")
-
     svc = sheets_service()
 
+    existing_title = ensure_tab(svc, OUTPUT_SHEET_NAME)
+    sent_map = load_existing_sent_map(svc, existing_title)
+    if sent_map:
+        print(f"🕘 Carrying forward email_sent history for {len(sent_map)} lead(s).")
+
     all_rows_out = []
-    output_headers_norm = [norm_header(h) for h in OUTPUT_HEADERS]
+    seen = set()
+    duplicates = 0
 
     for tab in SOURCE_SHEETS:
-        rows = read_sheet_values(svc, tab, "A1:ZZ")
+        rows = get_values(svc, tab)
         if not rows or len(rows) < 2:
             print(f"⚠️ Skipping '{tab}' (empty or no data).")
             continue
 
         header = rows[0]
-        header_map = build_header_index_map(header)
+        header_map = build_header_map(header)
+        # Columns with no alias mapping (notes, hobby, fe, ...) fall back to
+        # exact normalized-name matching.
+        exact_map = {normalize_header(h): i for i, h in enumerate(header)}
 
-        # Build each output row in OUTPUT_HEADERS order
+        col_for_output = {}
+        for out_h in OUTPUT_HEADERS:
+            field = OUTPUT_FIELD_FOR_HEADER.get(out_h)
+            idx = header_map.get(field) if field else None
+            if idx is None:
+                idx = exact_map.get(normalize_header(out_h))
+            col_for_output[out_h] = idx
+
+        missing_critical = [h for h in ("email", "number")
+                            if col_for_output.get(h) is None]
+        if missing_critical:
+            print(f"⚠️ '{tab}': no column found for {missing_critical} — "
+                  "those cells will be blank.")
+
+        added = 0
         for r in rows[1:]:
-            out_row = []
-            for out_h_norm in output_headers_norm:
-                idx = header_map.get(out_h_norm)
-                out_row.append(get_cell(r, idx))
+            e = normalize_email(get_cell(r, col_for_output.get("email")))
+            p = normalize_phone(get_cell(r, col_for_output.get("number")),
+                                keep_original=False)
+            key = dedupe_key(e, p)
+            if key and key in seen:
+                duplicates += 1
+                continue
+            if key:
+                seen.add(key)
+
+            out_row = [get_cell(r, col_for_output[h]) for h in OUTPUT_HEADERS]
+            if key and key in sent_map:
+                out_row[OUTPUT_HEADERS.index("email_sent")] = sent_map[key]
             all_rows_out.append(out_row)
+            added += 1
 
-        print(f"✅ Added {len(rows)-1} rows from '{tab}'")
+        print(f"✅ Added {added} row(s) from '{tab}'")
 
-    ensure_output_tab_exists(svc, OUTPUT_SHEET_NAME)
+    if not all_rows_out:
+        raise SystemExit(
+            "❌ All source tabs were empty — refusing to overwrite "
+            f"'{existing_title}' with nothing. (Tab left untouched.)"
+        )
 
-    # Write output
-    clear_sheet(svc, OUTPUT_SHEET_NAME)
-    write_values(svc, OUTPUT_SHEET_NAME, "A1", [OUTPUT_HEADERS])
-    if all_rows_out:
-        write_values(svc, OUTPUT_SHEET_NAME, "A2", all_rows_out)
+    overwrite_tab(svc, existing_title, OUTPUT_HEADERS, all_rows_out)
+    print(f"\n✅ Done. Wrote {len(all_rows_out)} combined row(s) into "
+          f"'{existing_title}' ({duplicates} duplicate(s) skipped).")
 
-    print(f"\n✅ Done. Wrote {len(all_rows_out)} combined rows into '{OUTPUT_SHEET_NAME}'.")
 
 if __name__ == "__main__":
     combine()

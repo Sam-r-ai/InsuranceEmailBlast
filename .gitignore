@@ -2,6 +2,10 @@
 credentials.json
 __pycache__/
 token.json
-sheet_service_account.json
-images
 token_cleanup.json
+token_unsubscribes.json
+token_followups.json
+sheet_service_account.json
+sheets_service_account.json
+*service_account*.json
+images

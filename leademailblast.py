@@ -1,381 +1,380 @@
+# leademailblast.py
+# Sends the first-touch email to every unsent lead on one tab of the leads
+# spreadsheet, marking each row's email_sent cell as it goes.
+#
+# Before every run it:
+#   - validates the .env config (no more "CA License: None" emails)
+#   - loads the suppression list (Invalid_Email + Unsubscribes tabs) and
+#     skips anyone on it — CAN-SPAM requires honoring opt-outs
+#   - dedupes addresses, so the same person is never emailed twice
+#
+# Every message includes the CAN-SPAM essentials: physical postal address,
+# ad identification, working unsubscribe instructions, a List-Unsubscribe
+# header, and the license number adjacent to the agent's name (CA Ins. Code
+# 1725.5). Messages are multipart plain-text + HTML.
+#
+# Useful .env knobs (see .env.example): DRY_RUN=true prints instead of
+# sending; TEST_SEND_TO=you@gmail.com sends every email to yourself.
+
 import os
-import time
+import sys
 import base64
-import re
-from datetime import datetime
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from dotenv import load_dotenv
+import html
 from email.mime.image import MIMEImage
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
-from google.oauth2.credentials import Credentials
-from google.oauth2 import service_account
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
-from google.auth.exceptions import RefreshError
+from googleapiclient.errors import HttpError
 
-count = 0
-BUSINESS_CARD_PATH = r"images\Justin_Cheung.png"
-CARRIERS_CARD_PATH = r"images\Carriers.png"
+from common import (
+    ALIASES, build_header_map, col_index_to_letter, ensure_column, env_flag,
+    env_int, get_cell, get_values, gmail_service, jitter_sleep,
+    load_suppression_set, normalize_email, now_timestamp, require_env,
+    sheets_service, split_name, titlecase_name, update_values, with_backoff,
+)
 
-# --- Load environment variables ---
-load_dotenv()
-AGENT_NAME = os.getenv("AGENT_NAME")
-AGENT_LICENSE = os.getenv("AGENT_NUMBER")
-WORK_PHONE = os.getenv("WORK_PHONE")
-WORK_EMAIL = os.getenv("WORK_EMAIL")
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+# --- Required configuration (from .env) ---
+AGENT_NAME, WORK_PHONE, WORK_EMAIL, POSTAL_ADDRESS = require_env(
+    "AGENT_NAME", "WORK_PHONE", "WORK_EMAIL", "POSTAL_ADDRESS"
+)
+# AGENT_NUMBER kept as a fallback: older .env files used that name.
+AGENT_LICENSE = (os.getenv("AGENT_LICENSE") or os.getenv("AGENT_NUMBER") or "").strip()
+if not AGENT_LICENSE:
+    raise SystemExit("❌ Missing AGENT_LICENSE in .env (your insurance license number).")
 
-# --- Gmail API (OAuth2) ---
-GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
-
-def authenticate_gmail():
-    creds = None
-
-    if os.path.exists("token.json"):
-        creds = Credentials.from_authorized_user_file("token.json", GMAIL_SCOPES)
-
-    try:
-        if not creds or not creds.valid:
-            flow = InstalledAppFlow.from_client_secrets_file("credentials.json", GMAIL_SCOPES)
-            creds = flow.run_local_server(port=0)
-            with open("token.json", "w") as token:
-                token.write(creds.to_json())
-
-        return build("gmail", "v1", credentials=creds)
-
-    except RefreshError:
-        # token is revoked/broken -> delete + re-auth
-        if os.path.exists("token.json"):
-            os.remove("token.json")
-
-        flow = InstalledAppFlow.from_client_secrets_file("credentials.json", GMAIL_SCOPES)
-        creds = flow.run_local_server(port=0)
-        with open("token.json", "w") as token:
-            token.write(creds.to_json())
-
-        return build("gmail", "v1", credentials=creds)
-
-# --- Google Sheets API (Service Account) ---
-SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-SERVICE_ACCOUNT_FILE = "sheet_service_account.json"
-
-# ✅ Edit these and press ▶ in VS Code
-TARGET_SHEET_NAME = "Bad_Numbers_Email"
+# --- Optional configuration ---
+AGENCY_NAME = os.getenv("AGENCY_NAME", "Family First Life")
+LICENSE_STATE = os.getenv("LICENSE_STATE", "CA")
+BOOKING_URL = (os.getenv("BOOKING_URL") or "").strip()
+TARGET_SHEET_NAME = os.getenv("TARGET_SHEET_NAME", "Bad_Numbers_Email")
 TARGET_RANGE = "A1:ZZ"
+DAILY_LIMIT = env_int("DAILY_LIMIT", 25)
+DELAY_MIN_SECONDS = env_int("DELAY_MIN_SECONDS", 60)
+DELAY_MAX_SECONDS = env_int("DELAY_MAX_SECONDS", 180)
+DRY_RUN = env_flag("DRY_RUN")
+TEST_SEND_TO = (os.getenv("TEST_SEND_TO") or "").strip()
 
-# ✅ Header aliases (added "number" under phone)
-ALIASES = {
-    "first_name": ["first", "first name", "firstname", "fname", "given name"],
-    "last_name": ["last", "last name", "lastname", "lname", "surname", "family name"],
-    "full_name": ["name", "full name", "fullname", "client name", "prospect name"],
-    "email": ["email", "e-mail", "email address", "mail"],
-    "phone": ["phone", "phone number", "number", "mobile", "cell", "cell phone", "telephone", "tel", "contact number"],
-    "email_sent": ["email_sent", "email sent", "emailed", "emailed_date", "email date", "sent at", "sent_on", "sent date"],
-}
+BUSINESS_CARD_PATH = os.getenv("BUSINESS_CARD_PATH", os.path.join("images", "Justin_Cheung.png"))
+CARRIERS_CARD_PATH = os.getenv("CARRIERS_CARD_PATH", os.path.join("images", "Carriers.png"))
 
-EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
+GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
+GMAIL_TOKEN_FILE = "token.json"
 
-def sheets_service():
-    creds = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE, scopes=SHEETS_SCOPES
+
+# ---------------------------------------------------------------------------
+# Message content
+# ---------------------------------------------------------------------------
+
+def build_subject(first_name):
+    if first_name:
+        return f"{first_name}, your life insurance request"
+    return "your life insurance request"
+
+
+def signature_text():
+    return (
+        f"{AGENT_NAME} — {LICENSE_STATE} License #{AGENT_LICENSE}\n"
+        f"Life Insurance & Annuities Broker, {AGENCY_NAME}\n"
+        f"Phone: {WORK_PHONE}\n"
+        f"Email: {WORK_EMAIL}"
     )
-    return build("sheets", "v4", credentials=creds)
 
-def normalize_header(h: str) -> str:
-    h = (h or "").strip().lower()
-    h = re.sub(r"[\s\-_]+", " ", h)
-    h = re.sub(r"[^a-z0-9 ]+", "", h)
-    return h
 
-def build_header_map(header_row):
-    headers = [normalize_header(h) for h in header_row]
-    idx = {}
+def footer_text():
+    return (
+        "This is an advertisement for life insurance products. "
+        "I'm contacting you because you responded to an ad or online form "
+        "requesting life insurance information.\n"
+        "If you'd prefer not to receive emails from me, just reply with "
+        '"unsubscribe" and I will take you off my list.\n'
+        f"{AGENT_NAME}, {POSTAL_ADDRESS}"
+    )
 
-    # exact match
-    for field, aliases in ALIASES.items():
-        for i, h in enumerate(headers):
-            if h in aliases:
-                idx[field] = i
-                break
 
-    # contains match
-    for field, aliases in ALIASES.items():
-        if field in idx:
-            continue
-        for i, h in enumerate(headers):
-            for a in aliases:
-                if a in h:
-                    idx[field] = i
-                    break
-            if field in idx:
-                break
+def build_body_text(greeting_name):
+    booking = (
+        f"\n\nYou can also book a time directly on my calendar: {BOOKING_URL}"
+        if BOOKING_URL else ""
+    )
+    return f"""Hi {greeting_name},
 
-    return idx
+My name is {AGENT_NAME}, a licensed life insurance broker with {AGENCY_NAME}. I work with the top-rated carriers across the United States, and I'm reaching out because you previously requested information about life insurance coverage options.
 
-def get_cell(row, col_idx):
-    if col_idx is None:
-        return ""
-    return row[col_idx] if col_idx < len(row) else ""
+Whether you're a young family looking for income replacement to secure your family's future, or a senior on a fixed income who needs affordable final expense coverage, my job is to find the right fit for your situation — at no cost to you.
 
-def normalize_email(x: str) -> str:
-    if not x:
-        return ""
-    m = EMAIL_RE.search(str(x).strip())
-    return m.group(0).lower() if m else ""
+Would a quick 10-minute call to look at your options be worth it? Just reply with a good time to talk.{booking}
 
-def normalize_phone(x: str) -> str:
-    if not x:
-        return ""
-    digits = re.sub(r"\D", "", str(x))
-    if len(digits) == 11 and digits.startswith("1"):
-        digits = digits[1:]
-    return digits if len(digits) == 10 else str(x).strip()
+Sincerely,
+{signature_text()}
 
-def titlecase_name(x: str) -> str:
-    return str(x).strip().title() if x else ""
+--
+{footer_text()}
+"""
 
-def split_name(full: str):
-    full = (full or "").strip()
-    if not full:
-        return "", ""
-    parts = full.split()
-    if len(parts) == 1:
-        return parts[0].title(), ""
-    return parts[0].title(), " ".join(parts[1:]).title()
 
-def col_index_to_letter(idx0: int) -> str:
-    n = idx0 + 1
-    letters = ""
-    while n > 0:
-        n, rem = divmod(n - 1, 26)
-        letters = chr(65 + rem) + letters
-    return letters
+def build_body_html(greeting_name, include_images):
+    e = html.escape
+    booking_html = (
+        f"""
+    <p>
+      You can also book a time directly on my calendar:<br>
+      <a href="{e(BOOKING_URL, quote=True)}" style="color: #0066cc;">{e(BOOKING_URL)}</a>
+    </p>"""
+        if BOOKING_URL else ""
+    )
+    images_html = (
+        """
+    <p style="margin-top:20px;">
+      <img src="cid:businesscard" alt="Business card" style="max-width:420px;width:100%;border-radius:6px;display:block;margin-bottom:10px;">
+      <img src="cid:carrierscard" alt="Our carriers" style="max-width:420px;width:100%;border-radius:6px;display:block;">
+    </p>"""
+        if include_images else ""
+    )
+    return f"""
+<html>
+  <body style="font-family: Arial, Helvetica, sans-serif; font-size: 14px; color: #000; line-height: 1.6;">
+    <p>Hi {e(greeting_name)},</p>
 
-def now_timestamp_local():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    <p>
+      My name is <strong>{e(AGENT_NAME)}</strong>, a licensed life insurance broker with
+      <strong>{e(AGENCY_NAME)}</strong>. I work with the top-rated carriers across the
+      United States, and I'm reaching out because you previously requested information
+      about life insurance coverage options.
+    </p>
 
-def read_sheet_rows(sheets_svc):
-    rng = f"'{TARGET_SHEET_NAME}'!{TARGET_RANGE}"
-    result = sheets_svc.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=rng
-    ).execute()
-    return result.get("values", [])
+    <p>
+      Whether you're a young family looking for <strong>income replacement</strong> to
+      secure your family's future, or a senior on a fixed income who needs
+      <strong>affordable final expense coverage</strong>, my job is to find the right
+      fit for your situation &mdash; at no cost to you.
+    </p>
 
-def update_cell(sheets_svc, col_idx0: int, row_number_1based: int, value: str):
-    col_letter = col_index_to_letter(col_idx0)
-    a1 = f"'{TARGET_SHEET_NAME}'!{col_letter}{row_number_1based}"
-    sheets_svc.spreadsheets().values().update(
-        spreadsheetId=SPREADSHEET_ID,
-        range=a1,
-        valueInputOption="RAW",
-        body={"values": [[value]]}
-    ).execute()
+    <p>
+      Would a quick 10-minute call to look at your options be worth it?
+      Just reply with a good time to talk.
+    </p>{booking_html}
 
-def ensure_email_sent_column_exists(rows, header_map, sheets_svc):
-    header = rows[0] if rows else []
-    if "email_sent" in header_map:
-        return header_map, header
+    <p>Sincerely,</p>
+    <p>
+      <strong>{e(AGENT_NAME)}</strong> &mdash; {e(LICENSE_STATE)} License #{e(AGENT_LICENSE)}<br>
+      Life Insurance &amp; Annuities Broker, {e(AGENCY_NAME)}<br>
+      &#128222; {e(WORK_PHONE)}<br>
+      &#128231; {e(WORK_EMAIL)}
+    </p>{images_html}
 
-    new_header = header[:] + ["email_sent"]
-    sheets_svc.spreadsheets().values().update(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"'{TARGET_SHEET_NAME}'!A1",
-        valueInputOption="RAW",
-        body={"values": [new_header]}
-    ).execute()
+    <hr style="border:none;border-top:1px solid #ddd;margin:20px 0;">
 
-    header_map = build_header_map(new_header)
-    return header_map, new_header
+    <p style="font-size: 12px; color: #555;">
+      This is an advertisement for life insurance products. I'm contacting you because
+      you responded to an ad or online form requesting life insurance information.<br>
+      If you'd prefer not to receive emails from me, just reply with
+      &ldquo;unsubscribe&rdquo; and I will take you off my list.<br>
+      {e(AGENT_NAME)}, {e(POSTAL_ADDRESS)}
+    </p>
+  </body>
+</html>
+"""
 
-def format_phone_us(digits: str) -> str:
-    """
-    Takes 10-digit string and formats as (XXX) XXX-XXXX
-    """
-    if not digits:
-        return ""
-    digits = re.sub(r"\D", "", digits)
-    if len(digits) != 10:
-        return digits  # fallback: return as-is
-    return f"({digits[0:3]}) {digits[3:6]}-{digits[6:10]}"
 
-# --- Gmail Functions ---
-def create_message(to, subject, body_html, cards_dict=None):
+# ---------------------------------------------------------------------------
+# Gmail
+# ---------------------------------------------------------------------------
+
+def available_inline_images():
+    """Only attach images that actually exist, and only reference the CIDs we
+    attach — no more emails with broken image placeholders."""
+    cards = {"businesscard": BUSINESS_CARD_PATH, "carrierscard": CARRIERS_CARD_PATH}
+    found = {cid: path for cid, path in cards.items() if os.path.exists(path)}
+    missing = [path for path in cards.values() if not os.path.exists(path)]
+    return found, missing
+
+
+def create_message(to, subject, body_text, body_html, images):
     message = MIMEMultipart("related")
     message["to"] = to
     message["subject"] = subject
+    message["reply-to"] = WORK_EMAIL
+    # Lets Gmail show an Unsubscribe button and turn would-be spam reports
+    # into harmless unsubscribes.
+    message["List-Unsubscribe"] = f"<mailto:{WORK_EMAIL}?subject=unsubscribe>"
 
     alternative = MIMEMultipart("alternative")
     message.attach(alternative)
-
+    alternative.attach(MIMEText(body_text, "plain", "utf-8"))
     alternative.attach(MIMEText(body_html, "html", "utf-8"))
 
-    # Attach images inline (CIDs)
-    if cards_dict:
-        for cid, path in cards_dict.items():
-            if not os.path.exists(path):
-                print(f"Warning: Image not found: {path}")
-                continue
-            with open(path, "rb") as f:
-                img = MIMEImage(f.read())
-                img.add_header("Content-ID", f"<{cid}>")
-                img.add_header("Content-Disposition", "inline", filename=os.path.basename(path))
-                message.attach(img)
+    for cid, path in images.items():
+        with open(path, "rb") as f:
+            img = MIMEImage(f.read())
+        img.add_header("Content-ID", f"<{cid}>")
+        img.add_header("Content-Disposition", "inline", filename=os.path.basename(path))
+        message.attach(img)
 
     raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
     return {"raw": raw}
 
-def send_email(gmail_service, to_name, to_email, to_phone):
-    subject = f"{to_name}, Life Insurance Inquiry"
 
-    body_html = f"""
-<html>
-  <body style="font-family: Arial, Helvetica, sans-serif; font-size: 14px; color: #000; line-height: 1.6;">
-    <p>Hi {to_name},</p>
+def is_quota_exceeded(err):
+    """Gmail's daily-quota block: retrying is pointless (the account is
+    send-blocked for up to 24h), so the run must stop."""
+    text = str(err).lower()
+    return "quota exceeded" in text or "5.4.5" in text
 
-    <p>
-      My name is <strong>Justin Cheung</strong> with <strong>Family First Life</strong>. 
-      I am a life insurance broker working with the top rated carriers across the United States.
-    </p>
 
-    <p>
-      I'm reaching out because a while ago you had inquired through our online portal 
-      looking into your coverage options. Whether you are a young family looking for 
-      <strong>income replacement</strong> securing your family's future, or a senior 
-      living on fixed income needing <strong>affordable final expense coverage</strong> 
-      to remove financial burden from the family, I am here to find the perfect solution.
-    </p>
+def send_email(gmail, to_name, to_email, images):
+    subject = build_subject(to_name)
+    body_text = build_body_text(to_name or "there")
+    body_html = build_body_html(to_name or "there", include_images=bool(images))
+    msg = create_message(to_email, subject, body_text, body_html, images)
+    with_backoff(
+        lambda: gmail.users().messages().send(userId="me", body=msg).execute(),
+        what=f"send to {to_email}",
+    )
 
-    <p>
-      I am open to meeting you. Reply to me a good time to meetand I will see if I can fit you in.
-    </p>
 
-    <p>
-      You may also book an appointment directly on my calendar here:<br>
-      <a href="https://calendly.com/justingimho/life-insurance-consulting" style="color: #0066cc;">
-        https://calendly.com/justingimho/life-insurance-consulting
-      </a>
-    </p>
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
 
-    <p>Sincerely,</p>
-          <strong>{AGENT_NAME}</strong><br>
-          Life Insurance &amp; Annuities Broker<br>
-          CA License: {AGENT_LICENSE}<br>
-          📞 {WORK_PHONE}<br>
-          📧 {WORK_EMAIL}<br>
-        
-        <p style="margin-top:20px;">
-            <img src="cid:businesscard" alt="Business Card" style="max-width:420px;width:100%;border-radius:6px;display:block;margin-bottom:10px;">
-            <img src="cid:carrierscard" alt="Carriers" style="max-width:420px;width:100%;border-radius:6px;display:block;">
-        </p>
-
-        <hr style="border:none;border-top:1px solid #ddd;margin:20px 0;">
-
-        <p style="font-size: 12px; color: #555;">
-          If you’d prefer not to receive emails from me, just reply with “unsubscribe”
-          and I’ll take you off my list.
-        </p>
-      </body>
-    </html>
-    """
-
-    # Mapping CIDs to file paths
-    cards = {
-        "businesscard": BUSINESS_CARD_PATH,
-        "carrierscard": CARRIERS_CARD_PATH
-    }
-
-    msg = create_message(to_email, subject, body_html, cards_dict=cards)
-    gmail_service.users().messages().send(userId="me", body=msg).execute()
-
-# --- Run Program ---
-if __name__ == "__main__":
-    gmail_service = authenticate_gmail()
+def main():
     sheets_svc = sheets_service()
 
-    rows = read_sheet_rows(sheets_svc)
+    images, missing_images = available_inline_images()
+    for path in missing_images:
+        print(f"⚠️ Image not found, sending without it: {path}")
+
+    rows = get_values(sheets_svc, TARGET_SHEET_NAME, TARGET_RANGE)
     if not rows or len(rows) < 2:
-        raise RuntimeError("Sheet is empty or missing data rows.")
+        raise SystemExit(f"Sheet '{TARGET_SHEET_NAME}' is empty or missing data rows.")
 
-    header = rows[0]
-    header_map = build_header_map(header)
-
+    header_map = build_header_map(rows[0])
     if "email" not in header_map:
-        raise RuntimeError(
+        raise SystemExit(
             f"Couldn't find an EMAIL column in '{TARGET_SHEET_NAME}'.\n"
-            f"Header row was: {header}\n"
-            f"Rename header to one of: {ALIASES['email']}"
+            f"Header row was: {rows[0]}\n"
+            f"Rename a header to one of: {ALIASES['email']}"
         )
 
-    if "phone" not in header_map:
-        raise RuntimeError(
-            f"Couldn't find a PHONE column in '{TARGET_SHEET_NAME}'.\n"
-            f"Header row was: {header}\n"
-            f"Rename header to one of: {ALIASES['phone']}"
-        )
-
-    # Ensure email_sent exists
-    header_map, header = ensure_email_sent_column_exists(rows, header_map, sheets_svc)
+    header_map, _ = ensure_column(sheets_svc, TARGET_SHEET_NAME, rows[0], header_map, "email_sent")
+    print("✅ Detected header mapping:", header_map)
 
     first_idx = header_map.get("first_name")
     last_idx = header_map.get("last_name")
     full_idx = header_map.get("full_name")
     email_idx = header_map.get("email")
-    phone_idx = header_map.get("phone")
     email_sent_idx = header_map.get("email_sent")
+    sent_col_letter = col_index_to_letter(email_sent_idx)
 
-    print("✅ Detected header mapping:", header_map)
+    print("🔎 Loading suppression list (bounces + unsubscribes)...")
+    suppressed = load_suppression_set(sheets_svc)
+    print(f"✅ {len(suppressed)} suppressed address(es) will be skipped.")
 
-    # Find first unsent row
-    start_row_number_1based = None
-    for row_number_1based, row in enumerate(rows[1:], start=2):
-        sent_val = str(get_cell(row, email_sent_idx)).strip()
-        email_val = normalize_email(get_cell(row, email_idx))
-        if email_val and not sent_val:
-            start_row_number_1based = row_number_1based
+    # Addresses already emailed anywhere on this tab (so a duplicate row
+    # can't trigger a second copy).
+    already_sent = set()
+    for row in rows[1:]:
+        if str(get_cell(row, email_sent_idx)).strip():
+            addr = normalize_email(get_cell(row, email_idx))
+            if addr:
+                already_sent.add(addr)
+
+    if DRY_RUN:
+        print("🧪 DRY_RUN is on — nothing will be sent and nothing written to the sheet.")
+        gmail = None
+    else:
+        gmail = gmail_service(GMAIL_SCOPES, GMAIL_TOKEN_FILE)
+    if TEST_SEND_TO:
+        print(f"🧪 TEST_SEND_TO is set — every email goes to {TEST_SEND_TO}; "
+              "the sheet will NOT be marked.")
+
+    sent = skipped_suppressed = skipped_duplicate = errors = 0
+    emailed_this_run = set()
+
+    def mark_row(row_number, value):
+        update_values(sheets_svc, TARGET_SHEET_NAME,
+                      f"{sent_col_letter}{row_number}", [[value]])
+
+    for row_number, row in enumerate(rows[1:], start=2):
+        if sent >= DAILY_LIMIT:
+            print(f"🛑 Reached the per-run limit of {DAILY_LIMIT} emails. "
+                  f"Stopping — {sent} sent this run.")
             break
 
-    if start_row_number_1based is None:
-        print("✅ No unsent leads found (everyone has email_sent filled).")
-        raise SystemExit(0)
-
-    print(f"▶ Starting from first unsent lead at row {start_row_number_1based}...")
-
-    for row_number_1based, row in enumerate(rows[start_row_number_1based - 1:], start=start_row_number_1based):
         email = normalize_email(get_cell(row, email_idx))
         if not email:
             continue
+        if str(get_cell(row, email_sent_idx)).strip():
+            continue
 
-        sent_val = str(get_cell(row, email_sent_idx)).strip()
-        if sent_val:
+        if email in suppressed:
+            skipped_suppressed += 1
+            print(f"⛔ Row {row_number}: {email} is on the suppression list "
+                  "(bounced or unsubscribed) — skipping.")
+            if not DRY_RUN and not TEST_SEND_TO:
+                mark_row(row_number, "suppressed (bounce/unsubscribe)")
+            continue
+
+        if email in already_sent or email in emailed_this_run:
+            skipped_duplicate += 1
+            print(f"↪️ Row {row_number}: {email} already emailed — skipping duplicate.")
+            if not DRY_RUN and not TEST_SEND_TO:
+                mark_row(row_number, "duplicate — already emailed")
             continue
 
         first = titlecase_name(get_cell(row, first_idx)) if first_idx is not None else ""
         last = titlecase_name(get_cell(row, last_idx)) if last_idx is not None else ""
         if (not first and not last) and full_idx is not None:
-            first, last = split_name(get_cell(row, full_idx))
-        name_for_greeting = first or "there"
+            first, _ = split_name(get_cell(row, full_idx))
+        greeting_name = first or ""
 
-        raw_phone = normalize_phone(get_cell(row, phone_idx))
-        to_phone = format_phone_us(raw_phone)
+        to_address = TEST_SEND_TO or email
 
-        if not to_phone:
-            # If you want to skip rows with missing phone, keep this:
-            # continue
-            to_phone = "your current number"
+        if DRY_RUN:
+            print(f"🧪 Would send to {to_address} (row {row_number}, "
+                  f"subject: {build_subject(greeting_name)!r})")
+            emailed_this_run.add(email)
+            sent += 1
+            continue
 
-        send_email(gmail_service, name_for_greeting, email, to_phone)
+        try:
+            send_email(gmail, greeting_name, to_address, images)
+        except HttpError as e:
+            if is_quota_exceeded(e):
+                print(f"🛑 Gmail daily sending quota exceeded — stopping the run. "
+                      f"({sent} sent before the block.)")
+                break
+            errors += 1
+            print(f"❌ Row {row_number}: failed to send to {email}: {e}")
+            continue
 
-        ts = now_timestamp_local()
-        update_cell(sheets_svc, email_sent_idx, row_number_1based, ts)
+        emailed_this_run.add(email)
+        sent += 1
 
-        count += 1
-        print(f"✅ Sent email #{count} to {name_for_greeting} at {email} | phone={to_phone} | email_sent={ts}")
-        time.sleep(2)
+        if not TEST_SEND_TO:
+            ts = now_timestamp()
+            try:
+                mark_row(row_number, ts)
+            except HttpError as e:
+                # The send DID happen. Surface it loudly so the row can be
+                # marked by hand — otherwise the next run re-emails this lead.
+                print(f"🚨 SENT to {email} but FAILED to mark row {row_number} "
+                      f"({sent_col_letter}{row_number}). Mark it manually before "
+                      f"the next run! Error: {e}")
+                errors += 1
 
-#          Book an appointment on my calendar:
-#          <a href="https://calendly.com/justingimho/life-insurance-consulting">https://calendly.com/justingimho/life-insurance-consulting</a>
-#        </p>
-        if count == 25:
-            quit("Reached 75 emails sent. Stopping to avoid rate limits.")
+        print(f"✅ Sent #{sent} to {greeting_name or '(no name)'} at {to_address} "
+              f"(row {row_number})")
+
+        if sent < DAILY_LIMIT:
+            jitter_sleep(DELAY_MIN_SECONDS, DELAY_MAX_SECONDS)
+
+    print(
+        f"\n📊 Done. Sent: {sent} | suppressed: {skipped_suppressed} | "
+        f"duplicates: {skipped_duplicate} | errors: {errors}"
+    )
+    if errors:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
