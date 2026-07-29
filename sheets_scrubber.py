@@ -27,6 +27,7 @@ SOURCE_OF_TRUTH_SHEETS = [
 ]
 
 IGNORE_SHEETS = [
+    "MASTER",
     "Archive",
     "Do Not Touch",
 ]

@@ -27,8 +27,8 @@ SOURCE_SHEETS = [
 
 OUTPUT_SHEET_NAME = "Combined TTC 12/30"
 
-# ✅ Output column order (edit this anytime). email_sent is always kept as
-# the last column so blast history survives a re-combine.
+# ✅ Output column order (edit this anytime). The tracking columns stay at
+# the end so blast/follow-up history survives a re-combine.
 OUTPUT_HEADERS = [
     "first_name",
     "last_name",
@@ -41,8 +41,12 @@ OUTPUT_HEADERS = [
     "coverage",
     "fe",
     "email_sent",
+    "followup_sent",
+    "replied",
 ]
 # =========================
+
+TRACKING_HEADERS = ["email_sent", "followup_sent", "replied"]
 
 # Map each output header to a canonical ALIASES field so source columns can
 # be found under any recognizable name.
@@ -53,6 +57,8 @@ OUTPUT_FIELD_FOR_HEADER = {
     "email": "email",
     "state": "state",
     "email_sent": "email_sent",
+    "followup_sent": "followup_sent",
+    "replied": "replied",
 }
 
 
@@ -65,24 +71,26 @@ def dedupe_key(email, phone):
 
 
 def load_existing_sent_map(svc, tab_title):
-    """email/phone -> email_sent value from the CURRENT output tab."""
+    """email/phone -> {tracking header: value} from the CURRENT output tab."""
     sent_map = {}
     rows = get_values(svc, tab_title)
     if not rows or len(rows) < 2:
         return sent_map
     hmap = build_header_map(rows[0])
-    email_idx, phone_idx, sent_idx = hmap.get("email"), hmap.get("phone"), hmap.get("email_sent")
-    if sent_idx is None:
+    email_idx, phone_idx = hmap.get("email"), hmap.get("phone")
+    tracking_idx = {h: hmap.get(OUTPUT_FIELD_FOR_HEADER[h]) for h in TRACKING_HEADERS}
+    if all(i is None for i in tracking_idx.values()):
         return sent_map
     for r in rows[1:]:
-        sent_val = str(get_cell(r, sent_idx)).strip()
-        if not sent_val:
+        values = {h: str(get_cell(r, i)).strip()
+                  for h, i in tracking_idx.items() if i is not None}
+        if not any(values.values()):
             continue
         e = normalize_email(get_cell(r, email_idx))
         p = normalize_phone(get_cell(r, phone_idx), keep_original=False)
         key = dedupe_key(e, p)
         if key:
-            sent_map[key] = sent_val
+            sent_map[key] = values
     return sent_map
 
 
@@ -138,7 +146,9 @@ def combine():
 
             out_row = [get_cell(r, col_for_output[h]) for h in OUTPUT_HEADERS]
             if key and key in sent_map:
-                out_row[OUTPUT_HEADERS.index("email_sent")] = sent_map[key]
+                for h, val in sent_map[key].items():
+                    if val:
+                        out_row[OUTPUT_HEADERS.index(h)] = val
             all_rows_out.append(out_row)
             added += 1
 

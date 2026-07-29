@@ -35,13 +35,15 @@ FAILED_EMAIL_RE = re.compile(
     r"(?:to|address)\s+<?([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})>?", re.I
 )
 
-HARD_BOUNCE_PATTERNS = (
-    "address not found", "does not exist", "user unknown", "no such user",
-    "address rejected", "recipient not found", "550 5.1.1", "5.1.1",
+# Word-boundary regexes: a bare substring like "421" would match inside
+# message IDs and misfile bounces that belong in manual review.
+HARD_BOUNCE_RE = re.compile(
+    r"address not found|does not exist|user unknown|no such user|"
+    r"address rejected|recipient not found|\b550\b|\b5\.1\.1\b"
 )
-SOFT_BOUNCE_PATTERNS = (
-    "inbox full", "inbox is full", "mailbox full", "quota exceeded",
-    "delivery incomplete", "temporary", "try again later", "421",
+SOFT_BOUNCE_RE = re.compile(
+    r"inbox (?:is )?full|mailbox full|quota exceeded|delivery incomplete|"
+    r"temporar|try again later|\b421\b|\b4\.[0-9]\.[0-9]\b"
 )
 
 
@@ -59,9 +61,9 @@ def get_email_body(payload):
 
 def classify(body_lower, subject_lower):
     text = body_lower + " " + subject_lower
-    if any(p in text for p in HARD_BOUNCE_PATTERNS):
+    if HARD_BOUNCE_RE.search(text):
         return "hard", "Address not found"
-    if any(p in text for p in SOFT_BOUNCE_PATTERNS):
+    if SOFT_BOUNCE_RE.search(text):
         return "soft", "Inbox full / temporary problem"
     return "unknown", "Unclassified bounce"
 

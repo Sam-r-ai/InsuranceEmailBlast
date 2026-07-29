@@ -22,15 +22,18 @@ TARGET_SHEET_NAME = "Old Vets"   # change this
 TARGET_HEADERS = [
     "first_name", "last_name", "phone", "email",
     "age", "address", "city", "state", "zip",
-    "emailed", "emailed_date",
+    "emailed", "emailed_date", "followup_sent", "replied",
     "status", "notes", "extras_json"
 ]
 
 
 def extract_zip_anywhere(row):
+    # Only accept a zip at the END of a cell — '12345 Olive Blvd' must not
+    # donate its house number as a ZIP code.
     for c in row:
-        m = ZIP_RE.search(str(c or ""))
-        if m:
+        s = str(c or "").strip()
+        m = ZIP_RE.search(s)
+        if m and m.end() == len(s):
             return m.group(0)
     return ""
 
@@ -82,6 +85,7 @@ def organize_one_sheet_by_headers(sheet_name):
             mapped(row, "city"), mapped(row, "state"), zipc,
             # Carry send-tracking through re-runs instead of wiping it.
             mapped(row, "email_sent"), mapped(row, "emailed_date"),
+            mapped(row, "followup_sent"), mapped(row, "replied"),
             mapped(row, "status"), mapped(row, "notes"),
             json.dumps(extras, ensure_ascii=False),
         ])

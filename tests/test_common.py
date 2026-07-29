@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common import (  # noqa: E402
     build_header_map, col_index_to_letter, format_phone_us,
     is_unsubscribe_text, normalize_email, normalize_header, normalize_phone,
-    split_name, strip_quoted_text,
+    quote_tab, split_name, strip_quoted_text, titlecase_name,
 )
 
 
@@ -51,6 +51,16 @@ class TestNormalizers(unittest.TestCase):
         self.assertEqual(col_index_to_letter(25), "Z")
         self.assertEqual(col_index_to_letter(26), "AA")
         self.assertEqual(col_index_to_letter(27), "AB")
+
+    def test_titlecase_name_collapses_newlines(self):
+        # A newline in a name cell would otherwise land in the Subject
+        # header and crash message serialization.
+        self.assertEqual(titlecase_name("john\n(veteran)"), "John (Veteran)")
+        self.assertEqual(titlecase_name("  mary   jo "), "Mary Jo")
+
+    def test_quote_tab_escapes_apostrophes(self):
+        self.assertEqual(quote_tab("Leads"), "'Leads'")
+        self.assertEqual(quote_tab("John's referrals"), "'John''s referrals'")
 
 
 class TestHeaderMap(unittest.TestCase):
@@ -100,6 +110,56 @@ class TestHeaderMap(unittest.TestCase):
         m = build_header_map(["email", "email_sent", "followup_sent", "replied"])
         self.assertEqual(m["followup_sent"], 2)
         self.assertEqual(m["replied"], 3)
+
+    def test_st_maps_to_state_exact_only(self):
+        m = build_header_map(["First Name", "St", "Email"])
+        self.assertEqual(m["state"], 1)
+        # ...but "st" must never fuzzy-match inside other headers.
+        m2 = build_header_map(["First Name", "Email"])
+        self.assertNotIn("state", m2)
+
+
+class TestBounceClassification(unittest.TestCase):
+    def setUp(self):
+        from bounces import classify
+        self.classify = classify
+
+    def test_hard_bounce(self):
+        kind, _ = self.classify("550 5.1.1 the email account does not exist", "")
+        self.assertEqual(kind, "hard")
+
+    def test_soft_bounce(self):
+        kind, _ = self.classify("the recipient's inbox is full", "")
+        self.assertEqual(kind, "soft")
+
+    def test_message_id_does_not_look_soft(self):
+        # "421" buried inside an SMTP id must not classify as soft.
+        kind, _ = self.classify("delivered-to x; smtp id q421si8xyz", "")
+        self.assertEqual(kind, "unknown")
+
+
+class TestFollowupTimestampParsing(unittest.TestCase):
+    def setUp(self):
+        os.environ.setdefault("AGENT_NAME", "T")
+        os.environ.setdefault("AGENT_LICENSE", "1")
+        os.environ.setdefault("WORK_PHONE", "1")
+        os.environ.setdefault("WORK_EMAIL", "t@x.com")
+        os.environ.setdefault("POSTAL_ADDRESS", "1 Main St")
+        from followups import parse_sent_timestamp
+        self.parse = parse_sent_timestamp
+
+    def test_iso_formats(self):
+        self.assertIsNotNone(self.parse("2026-07-01 09:30:00"))
+        self.assertIsNotNone(self.parse("2026-07-01"))
+
+    def test_us_formats(self):
+        self.assertIsNotNone(self.parse("7/1/2026"))
+        self.assertIsNotNone(self.parse("07/01/2026 09:30:00"))
+
+    def test_markers_and_garbage(self):
+        self.assertIsNone(self.parse("suppressed (bounce/unsubscribe)"))
+        self.assertIsNone(self.parse("yes"))
+        self.assertIsNone(self.parse(""))
 
 
 class TestUnsubscribeDetection(unittest.TestCase):

@@ -7,13 +7,19 @@
 # list" — CAN-SPAM requires that promise to be honored within 10 business
 # days, so run this before every blast (and at least weekly).
 #
-# Only the text the sender actually TYPED is checked: quoted history is
-# stripped first, because every reply quotes our own footer, which contains
-# the word "unsubscribe".
+# False-positive guards — an address is only recorded when ALL of these hold:
+#   - the message is NOT from the agent's own account
+#   - the opt-out phrase appears in text the sender actually TYPED (quoted
+#     history is stripped first — every reply quotes our own footer, which
+#     contains the word "unsubscribe")
+#   - the message sits in a thread that contains mail WE sent (i.e. it is a
+#     genuine reply to our outreach, not a newsletter with its own
+#     unsubscribe footer)
 #
 # Processed messages get a Gmail label so they are never scanned twice.
 
 import base64
+import os
 
 from googleapiclient.errors import HttpError
 
@@ -28,10 +34,10 @@ GMAIL_TOKEN_FILE = "token_unsubscribes.json"
 
 PROCESSED_LABEL = "UnsubProcessed"
 
-# Candidate messages: inbox mail mentioning an opt-out phrase (or sent to the
-# List-Unsubscribe mailto:, which sets the subject to "unsubscribe").
+# Candidate messages: inbox mail addressed to us mentioning an opt-out phrase
+# (mail to the List-Unsubscribe mailto: has subject "unsubscribe").
 SEARCH_QUERY = (
-    f'in:inbox -label:{PROCESSED_LABEL} '
+    f'in:inbox to:me -label:{PROCESSED_LABEL} '
     '("unsubscribe" OR "opt out" OR "remove me" OR "stop emailing" OR "take me off")'
 )
 
@@ -69,10 +75,37 @@ def header_value(headers, name):
     return next((h["value"] for h in headers if h["name"].lower() == name.lower()), "")
 
 
+def is_reply_to_our_outreach(gmail, msg):
+    """True when the message's thread contains at least one message WE sent
+    (other than this message itself)."""
+    thread_id = msg.get("threadId")
+    if not thread_id:
+        return False
+    thread = with_backoff(
+        lambda: gmail.users().threads().get(
+            userId="me", id=thread_id, format="minimal"
+        ).execute(),
+        what="fetch thread",
+    )
+    for m in thread.get("messages", []):
+        if m.get("id") != msg.get("id") and "SENT" in m.get("labelIds", []):
+            return True
+    return False
+
+
 def main():
     gmail = gmail_service(GMAIL_SCOPES, GMAIL_TOKEN_FILE)
     sheets_svc = sheets_service()
     label_id = get_or_create_label(gmail, PROCESSED_LABEL)
+
+    profile = with_backoff(
+        lambda: gmail.users().getProfile(userId="me").execute(),
+        what="read profile",
+    )
+    own_addresses = {profile.get("emailAddress", "").lower()}
+    work_email = (os.getenv("WORK_EMAIL") or "").strip().lower()
+    if work_email:
+        own_addresses.add(work_email)
 
     print("Searching inbox for opt-out replies...")
     messages, page_token = [], None
@@ -122,12 +155,24 @@ def main():
         sender = normalize_email(header_value(headers, "From"))
         subject = header_value(headers, "Subject")
 
+        if sender in own_addresses:
+            # Our own mail (e.g. a TEST_SEND_TO preview, whose footer
+            # contains "unsubscribe"). Never an opt-out.
+            labeled.append(msg_meta["id"])
+            continue
+
         body = get_plain_body(payload) or msg.get("snippet", "")
         own_text = strip_quoted_text(body)
 
         if not (is_unsubscribe_text(own_text) or is_unsubscribe_text(subject)):
             # Keyword only appeared in quoted history (our own footer) —
             # a normal reply, not an opt-out. Label it so it isn't rescanned.
+            labeled.append(msg_meta["id"])
+            continue
+
+        if not is_reply_to_our_outreach(gmail, msg):
+            # Not part of a conversation we started — a newsletter or other
+            # third-party mail with its own unsubscribe wording.
             labeled.append(msg_meta["id"])
             continue
 

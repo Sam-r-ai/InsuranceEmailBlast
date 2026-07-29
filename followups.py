@@ -57,7 +57,8 @@ GMAIL_TOKEN_FILE = "token_followups.json"
 
 def parse_sent_timestamp(value):
     value = str(value or "").strip()
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d",
+                "%m/%d/%Y %H:%M:%S", "%m/%d/%Y", "%m/%d/%y"):
         try:
             return datetime.strptime(value, fmt)
         except ValueError:
@@ -181,8 +182,20 @@ def main():
         )
 
     header = rows[0]
-    header_map, header = ensure_column(sheets_svc, TARGET_SHEET_NAME, header, header_map, "followup_sent")
-    header_map, header = ensure_column(sheets_svc, TARGET_SHEET_NAME, header, header_map, "replied")
+    if DRY_RUN:
+        # DRY_RUN must not write anything — simulate missing columns instead.
+        width = max(len(header), max(len(r) for r in rows))
+        header_map = dict(header_map)
+        for field in ("followup_sent", "replied"):
+            if field not in header_map:
+                print(f"🧪 Would create a {field} column (DRY_RUN: not writing).")
+                header_map[field] = width
+                width += 1
+    else:
+        header_map, header = ensure_column(sheets_svc, TARGET_SHEET_NAME, header,
+                                           header_map, "followup_sent", rows=rows)
+        header_map, header = ensure_column(sheets_svc, TARGET_SHEET_NAME, header,
+                                           header_map, "replied", rows=rows)
 
     first_idx = header_map.get("first_name")
     full_idx = header_map.get("full_name")
@@ -198,6 +211,16 @@ def main():
     suppressed = load_suppression_set(sheets_svc)
     print(f"✅ {len(suppressed)} suppressed address(es) will be skipped.")
 
+    # Addresses already followed up (or known to have replied) ANYWHERE on
+    # the tab — so a duplicated row can never trigger a second follow-up.
+    already_followed = set()
+    for row in rows[1:]:
+        if (str(get_cell(row, header_map.get("followup_sent"))).strip()
+                or str(get_cell(row, header_map.get("replied"))).strip()):
+            addr = normalize_email(get_cell(row, header_map.get("email")))
+            if addr:
+                already_followed.add(addr)
+
     gmail = gmail_service(GMAIL_SCOPES, GMAIL_TOKEN_FILE)
     if DRY_RUN:
         print("🧪 DRY_RUN is on — nothing will be sent and nothing written to the sheet.")
@@ -206,8 +229,12 @@ def main():
               "the sheet will NOT be marked.")
 
     now = datetime.now()
-    sent = skipped_replied = skipped_suppressed = errors = 0
+    sent = skipped_replied = skipped_suppressed = errors = unparseable = 0
     emailed_this_run = set()
+
+    def mark_followup(row_number, value):
+        update_values(sheets_svc, TARGET_SHEET_NAME,
+                      f"{followup_col}{row_number}", [[value]])
 
     for row_number, row in enumerate(rows[1:], start=2):
         if sent >= DAILY_LIMIT:
@@ -215,25 +242,37 @@ def main():
             break
 
         email = normalize_email(get_cell(row, email_idx))
-        if not email or email in emailed_this_run:
+        if not email:
             continue
         if str(get_cell(row, followup_idx)).strip():
             continue  # already followed up
         if str(get_cell(row, replied_idx)).strip():
             continue  # already known to have replied
 
-        sent_ts = parse_sent_timestamp(get_cell(row, email_sent_idx))
+        if email in already_followed or email in emailed_this_run:
+            print(f"↪️ Row {row_number}: {email} already followed up on another "
+                  "row — marking this duplicate.")
+            if not DRY_RUN and not TEST_SEND_TO:
+                mark_followup(row_number, "duplicate — already followed up")
+            continue
+
+        sent_cell = str(get_cell(row, email_sent_idx)).strip()
+        sent_ts = parse_sent_timestamp(sent_cell)
         if sent_ts is None:
-            continue  # never sent, or the cell holds a skip marker
+            # Empty = never sent; a skip marker is expected. Anything else
+            # is a date we couldn't read — count it so it isn't invisible.
+            if sent_cell and not sent_cell.startswith(("suppressed", "duplicate")):
+                unparseable += 1
+                print(f"⚠️ Row {row_number}: can't read email_sent value "
+                      f"{sent_cell!r} — no follow-up will be sent for it.")
+            continue
         if (now - sent_ts).days < FOLLOWUP_DAYS:
             continue  # too soon
 
         if email in suppressed:
             skipped_suppressed += 1
             if not DRY_RUN and not TEST_SEND_TO:
-                update_values(sheets_svc, TARGET_SHEET_NAME,
-                              f"{followup_col}{row_number}",
-                              [["suppressed (bounce/unsubscribe)"]])
+                mark_followup(row_number, "suppressed (bounce/unsubscribe)")
             continue
 
         if has_replied(gmail, email):
@@ -273,15 +312,21 @@ def main():
             errors += 1
             print(f"❌ Row {row_number}: failed to send to {email}: {e}")
             continue
+        except Exception as e:
+            errors += 1
+            print(f"❌ Row {row_number}: send to {email} failed with "
+                  f"{type(e).__name__}: {e}\n"
+                  f"   ⚠️ The message MAY still have been delivered — check "
+                  f"Sent mail and mark the row by hand before re-running.")
+            continue
 
         emailed_this_run.add(email)
         sent += 1
 
         if not TEST_SEND_TO:
             try:
-                update_values(sheets_svc, TARGET_SHEET_NAME,
-                              f"{followup_col}{row_number}", [[now_timestamp()]])
-            except HttpError as e:
+                mark_followup(row_number, now_timestamp())
+            except Exception as e:
                 print(f"🚨 SENT follow-up to {email} but FAILED to mark row "
                       f"{row_number} ({followup_col}{row_number}). Mark it manually! "
                       f"Error: {e}")
@@ -295,7 +340,8 @@ def main():
 
     print(
         f"\n📊 Done. Follow-ups sent: {sent} | replied (skipped+marked): "
-        f"{skipped_replied} | suppressed: {skipped_suppressed} | errors: {errors}"
+        f"{skipped_replied} | suppressed: {skipped_suppressed} | "
+        f"unreadable email_sent: {unparseable} | errors: {errors}"
     )
     if errors:
         sys.exit(1)

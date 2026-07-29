@@ -255,7 +255,14 @@ def main():
             f"Rename a header to one of: {ALIASES['email']}"
         )
 
-    header_map, _ = ensure_column(sheets_svc, TARGET_SHEET_NAME, rows[0], header_map, "email_sent")
+    if DRY_RUN and "email_sent" not in header_map:
+        # DRY_RUN must not write anything — simulate the column instead.
+        print("🧪 Would create an email_sent column (DRY_RUN: not writing).")
+        header_map = dict(header_map)
+        header_map["email_sent"] = max(len(r) for r in rows)
+    else:
+        header_map, _ = ensure_column(sheets_svc, TARGET_SHEET_NAME, rows[0],
+                                      header_map, "email_sent", rows=rows)
     print("✅ Detected header mapping:", header_map)
 
     first_idx = header_map.get("first_name")
@@ -346,6 +353,13 @@ def main():
             errors += 1
             print(f"❌ Row {row_number}: failed to send to {email}: {e}")
             continue
+        except Exception as e:
+            errors += 1
+            print(f"❌ Row {row_number}: send to {email} failed with "
+                  f"{type(e).__name__}: {e}\n"
+                  f"   ⚠️ The message MAY still have been delivered — check "
+                  f"Sent mail and mark the row by hand before re-running.")
+            continue
 
         emailed_this_run.add(email)
         sent += 1
@@ -354,7 +368,7 @@ def main():
             ts = now_timestamp()
             try:
                 mark_row(row_number, ts)
-            except HttpError as e:
+            except Exception as e:
                 # The send DID happen. Surface it loudly so the row can be
                 # marked by hand — otherwise the next run re-emails this lead.
                 print(f"🚨 SENT to {email} but FAILED to mark row {row_number} "

@@ -7,12 +7,14 @@
 # in one script but kept in another, one script refreshed OAuth tokens and the
 # other didn't). Everything lives here now, once.
 
+import json
 import os
 import random
 import re
 import time
 from datetime import datetime
 
+import httplib2
 from dotenv import load_dotenv
 from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
@@ -59,7 +61,7 @@ ALIASES = {
     "age": ["age"],
     "address": ["address", "street", "street address", "address1", "address 1"],
     "city": ["city"],
-    "state": ["state", "province"],
+    "state": ["state", "st", "province"],
     "zip": ["zip", "zipcode", "zip code", "postal", "postal code"],
 }
 
@@ -129,12 +131,16 @@ def gmail_service(scopes, token_file, credentials_file="credentials.json"):
     creds = None
     if os.path.exists(token_file):
         try:
-            creds = Credentials.from_authorized_user_file(token_file, scopes)
-        except ValueError:
+            with open(token_file) as fh:
+                info = json.load(fh)
+            # Compare against the scopes STORED in the token: constructing
+            # Credentials with a scopes argument would report the requested
+            # scopes back, making the check always pass.
+            stored = set(info.get("scopes") or [])
+            if set(scopes) <= stored:
+                creds = Credentials.from_authorized_user_info(info, scopes)
+        except (ValueError, KeyError):
             creds = None
-
-    if creds and not creds.has_scopes(scopes):
-        creds = None  # token was minted for different scopes; re-consent
 
     if creds and creds.expired and creds.refresh_token:
         try:
@@ -163,11 +169,12 @@ def gmail_service(scopes, token_file, credentials_file="credentials.json"):
 # ---------------------------------------------------------------------------
 
 RETRYABLE_STATUS = {429, 500, 502, 503}
+TRANSIENT_ERRORS = (ConnectionError, TimeoutError, httplib2.HttpLib2Error)
 
 
 def with_backoff(fn, *, retries=5, base_delay=2.0, what="API call"):
-    """Run fn(); on a retryable HttpError (429/5xx) wait 2s, 4s, 8s... and
-    retry. Non-retryable errors raise immediately."""
+    """Run fn(); on a retryable HttpError (429/5xx) or a transient transport
+    error wait 2s, 4s, 8s... and retry. Other errors raise immediately."""
     for attempt in range(retries + 1):
         try:
             return fn()
@@ -175,10 +182,15 @@ def with_backoff(fn, *, retries=5, base_delay=2.0, what="API call"):
             status = getattr(getattr(e, "resp", None), "status", None)
             if status not in RETRYABLE_STATUS or attempt == retries:
                 raise
-            delay = base_delay * (2 ** attempt)
-            print(f"⏳ {what} got HTTP {status}; retrying in {delay:.0f}s "
-                  f"(attempt {attempt + 1}/{retries})...")
-            time.sleep(delay)
+            reason = f"HTTP {status}"
+        except TRANSIENT_ERRORS as e:
+            if attempt == retries:
+                raise
+            reason = type(e).__name__
+        delay = base_delay * (2 ** attempt)
+        print(f"⏳ {what} got {reason}; retrying in {delay:.0f}s "
+              f"(attempt {attempt + 1}/{retries})...")
+        time.sleep(delay)
 
 
 def jitter_sleep(min_seconds, max_seconds):
@@ -228,7 +240,12 @@ def format_phone_us(digits):
 
 
 def titlecase_name(x):
-    return str(x).strip().title() if x else ""
+    """Title-cased name with ALL whitespace collapsed to single spaces — a
+    newline inside a name cell would otherwise end up in the Subject header
+    and crash message serialization."""
+    if not x:
+        return ""
+    return " ".join(str(x).split()).title()
 
 
 def split_name(full):
@@ -321,8 +338,14 @@ def col_index_to_letter(idx0):
 # Sheets I/O
 # ---------------------------------------------------------------------------
 
+def quote_tab(sheet_name):
+    """A1-notation tab reference; embedded single quotes must be doubled or
+    every range for that tab fails with 'Unable to parse range'."""
+    return "'" + sheet_name.replace("'", "''") + "'"
+
+
 def get_values(svc, sheet_name, a1_range="A1:ZZ"):
-    rng = f"'{sheet_name}'!{a1_range}"
+    rng = f"{quote_tab(sheet_name)}!{a1_range}"
     resp = with_backoff(
         lambda: svc.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID, range=rng
@@ -333,7 +356,7 @@ def get_values(svc, sheet_name, a1_range="A1:ZZ"):
 
 
 def update_values(svc, sheet_name, start_cell, values):
-    rng = f"'{sheet_name}'!{start_cell}"
+    rng = f"{quote_tab(sheet_name)}!{start_cell}"
     return with_backoff(
         lambda: svc.spreadsheets().values().update(
             spreadsheetId=SPREADSHEET_ID,
@@ -349,7 +372,7 @@ def append_values(svc, sheet_name, values):
     return with_backoff(
         lambda: svc.spreadsheets().values().append(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"'{sheet_name}'!A:Z",
+            range=f"{quote_tab(sheet_name)}!A:Z",
             valueInputOption="RAW",
             insertDataOption="INSERT_ROWS",
             body={"values": values},
@@ -361,7 +384,7 @@ def append_values(svc, sheet_name, values):
 def clear_values(svc, sheet_name, a1_range):
     return with_backoff(
         lambda: svc.spreadsheets().values().clear(
-            spreadsheetId=SPREADSHEET_ID, range=f"'{sheet_name}'!{a1_range}", body={}
+            spreadsheetId=SPREADSHEET_ID, range=f"{quote_tab(sheet_name)}!{a1_range}", body={}
         ).execute(),
         what=f"clear {sheet_name}",
     )
@@ -375,8 +398,8 @@ def list_sheet_titles(svc):
     return [s["properties"]["title"] for s in meta.get("sheets", [])]
 
 
-def get_sheet_id(svc, sheet_name):
-    """Numeric sheetId for a tab title (case-insensitive). None if absent."""
+def get_sheet_props(svc, sheet_name):
+    """Properties dict for a tab title (case-insensitive). None if absent."""
     meta = with_backoff(
         lambda: svc.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute(),
         what="read spreadsheet metadata",
@@ -384,8 +407,14 @@ def get_sheet_id(svc, sheet_name):
     want = sheet_name.strip().lower()
     for s in meta.get("sheets", []):
         if s["properties"]["title"].strip().lower() == want:
-            return s["properties"]["sheetId"]
+            return s["properties"]
     return None
+
+
+def get_sheet_id(svc, sheet_name):
+    """Numeric sheetId for a tab title (case-insensitive). None if absent."""
+    props = get_sheet_props(svc, sheet_name)
+    return props["sheetId"] if props else None
 
 
 def find_tab_title(svc, sheet_name):
@@ -463,14 +492,47 @@ def delete_rows(svc, sheet_name, row_numbers_1based):
     )
 
 
-def ensure_column(svc, sheet_name, header, header_map, field, header_label=None):
+def ensure_column(svc, sheet_name, header, header_map, field,
+                  header_label=None, rows=None):
     """Make sure a tracking column exists on the tab; append it to the header
-    row if missing. Pass the CURRENT header row and thread the returned one
-    into any further ensure_column calls. Returns (header_map, header_row)."""
+    row if missing. Pass the CURRENT header row (and, when available, all
+    rows) and thread the returned header into any further ensure_column
+    calls. Returns (header_map, header_row).
+
+    The new column goes AFTER the widest data row, not just after the header
+    — otherwise stray values in an unlabeled trailing column would be
+    mistaken for sent-markers and those leads silently skipped."""
     header = list(header or [])
     if field in header_map:
         return header_map, header
-    new_header = header + [header_label or field]
+
+    width = len(header)
+    if rows:
+        width = max(width, max(len(r) for r in rows))
+    if width > len(header):
+        print(f"⚠️ '{sheet_name}' has data beyond the labeled headers; "
+              f"placing the {header_label or field} column after it "
+              f"(column {col_index_to_letter(width)}).")
+
+    # values.update can't write past the tab's grid edge — widen the grid
+    # first if the new column wouldn't fit.
+    props = get_sheet_props(svc, sheet_name)
+    if props:
+        col_count = props.get("gridProperties", {}).get("columnCount", 0)
+        if width + 1 > col_count:
+            with_backoff(
+                lambda: svc.spreadsheets().batchUpdate(
+                    spreadsheetId=SPREADSHEET_ID,
+                    body={"requests": [{"appendDimension": {
+                        "sheetId": props["sheetId"],
+                        "dimension": "COLUMNS",
+                        "length": width + 1 - col_count,
+                    }}]},
+                ).execute(),
+                what=f"widen {sheet_name}",
+            )
+
+    new_header = header + [""] * (width - len(header)) + [header_label or field]
     update_values(svc, sheet_name, "A1", [new_header])
     return build_header_map(new_header), new_header
 
